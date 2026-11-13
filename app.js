@@ -1,9 +1,15 @@
 'use strict';
 /*
  * Bóveda — gestor de contraseñas personal.
- * Todo se cifra en el celular con AES-256-GCM. La clave sale de tus DOS
- * contraseñas (PBKDF2-SHA256, 600.000 iteraciones). Las contraseñas maestras
- * no se guardan en ningún lado. Nada se envía a ningún servidor.
+ *
+ * Cifrado (versión 2):
+ *  - Los datos se cifran con una clave aleatoria (AES-256-GCM).
+ *  - Esa clave se guarda "envuelta" dos veces:
+ *      1) con una clave que sale de tus DOS contraseñas, y
+ *      2) con una clave que sale de tu CÓDIGO DE RECUPERACIÓN.
+ *    Cualquiera de las dos abre la bóveda. Ninguna se guarda en ningún lado.
+ *  - Derivación: PBKDF2-SHA256, 600.000 iteraciones.
+ *  - Nada se envía a ningún servidor.
  */
 (() => {
   const ITER = 600000;
@@ -11,14 +17,17 @@
   const HIDDEN_MS = 30 * 1000;     // bloqueo al salir de la app
   const CLIP_MS = 30 * 1000;       // se borra el portapapeles
   const MIN_LEN = 8;
-  const BACKUP_NAG_DAYS = 7;
+  const GATE_CHANGES = 5;          // cambios sin respaldar que bloquean agregar
+  const GATE_FIRST = 3;            // entradas sin ningún respaldo que bloquean agregar
+  const B32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 
   const app = document.getElementById('app');
   const enc = new TextEncoder();
   const dec = new TextDecoder();
-  const S = { key: null, salt: null, iter: ITER, data: null, query: '' };
+  const S = { dk: null, key: null, rec: null, data: null, query: '', hold: false };
 
   // ---------- utilidades ----------
+  const rand = n => crypto.getRandomValues(new Uint8Array(n));
   function toB64(buf) {
     const u = new Uint8Array(buf); let s = '';
     for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000));
@@ -31,7 +40,7 @@
   }
   function uuid() {
     if (crypto.randomUUID) return crypto.randomUUID();
-    return toB64(crypto.getRandomValues(new Uint8Array(16))).replace(/[^a-z0-9]/gi, '');
+    return toB64(rand(16)).replace(/[^a-z0-9]/gi, '');
   }
 
   // Crea elementos sin innerHTML (evita inyección de código desde los datos).
@@ -78,40 +87,94 @@
   }
 
   // ---------- cifrado ----------
-  async function deriveKey(p1, p2, salt, iter) {
-    const material = enc.encode(p1.normalize('NFC') + '\u0000' + p2.normalize('NFC'));
-    const base = await crypto.subtle.importKey('raw', material, 'PBKDF2', false, ['deriveKey']);
+  const pwSecret = (p1, p2) => p1.normalize('NFC') + '\u0000' + p2.normalize('NFC');
+
+  function newRecoveryCode() {
+    let val = 0, bits = 0, out = '';
+    for (const x of rand(20)) {             // 160 bits → 32 caracteres
+      val = (val << 8) | x; bits += 8;
+      while (bits >= 5) { out += B32[(val >>> (bits - 5)) & 31]; bits -= 5; }
+      val &= (1 << bits) - 1;
+    }
+    return out.match(/.{4}/g).join('-');
+  }
+  const normCode = s => s.toUpperCase().replace(/[IL]/g, '1').replace(/O/g, '0').replace(/[^0-9A-Z]/g, '');
+  const codeLooksValid = s => s.length === 32 && [...s].every(c => B32.includes(c));
+
+  async function kek(secret, salt, iter) {
+    const base = await crypto.subtle.importKey('raw', enc.encode(secret), 'PBKDF2', false, ['deriveKey']);
     return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: iter, hash: 'SHA-256' },
       base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
   }
-  async function encryptVault(key, salt, iter, data) {
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, enc.encode(JSON.stringify(data)));
-    return { app: 'boveda', v: 1, kdf: 'PBKDF2-SHA256', iter, salt: toB64(salt), iv: toB64(iv), ct: toB64(ct) };
+  async function seal(key, bytes) {
+    const iv = rand(12);
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, bytes);
+    return { iv: toB64(iv), ct: toB64(ct) };
   }
-  // Si alguna contraseña es incorrecta, AES-GCM falla y esto tira error.
-  async function decryptVault(rec, p1, p2) {
-    const salt = fromB64(rec.salt);
-    const key = await deriveKey(p1, p2, salt, rec.iter);
-    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromB64(rec.iv) }, key, fromB64(rec.ct));
-    return { key, salt, iter: rec.iter, data: JSON.parse(dec.decode(pt)) };
+  // Si la clave es incorrecta, AES-GCM falla y esto tira error.
+  async function open(key, box) {
+    return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromB64(box.iv) }, key, fromB64(box.ct)));
   }
+  async function makeSlot(secret, dk) {
+    const salt = rand(16);
+    return { salt: toB64(salt), iter: ITER, ...(await seal(await kek(secret, salt, ITER), dk)) };
+  }
+  async function openSlot(secret, slot) {
+    return open(await kek(secret, fromB64(slot.salt), slot.iter), slot);
+  }
+  const dataKey = dk => crypto.subtle.importKey('raw', dk, 'AES-GCM', false, ['encrypt', 'decrypt']);
+
+  async function loadData(rec, dk) {
+    const key = await dataKey(dk);
+    const data = JSON.parse(dec.decode(await open(key, rec.data)));
+    return { dk, key, data, rec };
+  }
+  // Abre con las dos contraseñas. Las bóvedas de la versión 1 devuelven { legacy: datos }.
+  async function openWithPasswords(rec, p1, p2) {
+    if (rec.v === 1) {
+      const k = await kek(pwSecret(p1, p2), fromB64(rec.salt), rec.iter);
+      return { legacy: JSON.parse(dec.decode(await open(k, rec))) };
+    }
+    return loadData(rec, await openSlot(pwSecret(p1, p2), rec.pw));
+  }
+
+  const isStr = x => typeof x === 'string' && x.length > 0;
+  const okIter = n => Number.isInteger(n) && n >= 100000 && n <= 10000000;
+  const okBox = b => !!b && isStr(b.iv) && isStr(b.ct);
+  const okSlot = s => okBox(s) && isStr(s.salt) && okIter(s.iter);
   function validRecord(r) {
-    return r && typeof r === 'object' && r.app === 'boveda' && r.v === 1 &&
-      Number.isInteger(r.iter) && r.iter >= 100000 && r.iter <= 10000000 &&
-      ['salt', 'iv', 'ct'].every(k => typeof r[k] === 'string' && r[k].length > 0);
+    if (!r || typeof r !== 'object' || r.app !== 'boveda') return false;
+    if (r.v === 1) return okIter(r.iter) && isStr(r.salt) && okBox(r);
+    if (r.v === 2) return okSlot(r.pw) && okSlot(r.rc) && okBox(r.data);
+    return false;
+  }
+
+  function setSession(o) {
+    Object.assign(S, { dk: o.dk, key: o.key, rec: o.rec, data: o.data });
+    bump();
   }
   async function save() {
     S.data.updated = Date.now();
-    await dbPut('vault', await encryptVault(S.key, S.salt, S.iter, S.data));
+    const rec = { ...S.rec, data: await seal(S.key, enc.encode(JSON.stringify(S.data))) };
+    await dbPut('vault', rec);
+    S.rec = rec;
   }
+  // Crea una bóveda nueva (o migra una vieja) y devuelve el código de recuperación.
+  async function createVault(p1, p2, data) {
+    const dk = rand(32);
+    const code = newRecoveryCode();
+    const rec = { app: 'boveda', v: 2, pw: await makeSlot(pwSecret(p1, p2), dk), rc: await makeSlot(normCode(code), dk) };
+    setSession({ dk, key: await dataKey(dk), rec, data });
+    await save();
+    return code;
+  }
+  async function markChanged() { await dbPut('changes', ((await dbGet('changes')) || 0) + 1); }
+
   function genPassword(len = 20) {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!#$%&*+-=?@_';
     const max = 256 - (256 % chars.length); const out = [];
     while (out.length < len) {
-      for (const x of crypto.getRandomValues(new Uint8Array(len * 2))) {
-        if (x < max && out.length < len) out.push(chars[x % chars.length]);
-      }
+      for (const x of rand(len * 2)) if (x < max && out.length < len) out.push(chars[x % chars.length]);
     }
     return out.join('');
   }
@@ -124,7 +187,9 @@
     idleTimer = setTimeout(lock, IDLE_MS);
   }
   function lock() {
-    S.key = null; S.salt = null; S.data = null; S.query = '';
+    if (S.hold) return;   // no bloquear mientras se anota el código de recuperación
+    if (S.dk) S.dk.fill(0);
+    Object.assign(S, { dk: null, key: null, rec: null, data: null, query: '' });
     clearTimeout(idleTimer); clearTimeout(hideTimer);
     viewUnlock();
   }
@@ -172,7 +237,7 @@
     return h('span', { class: `av c${n % 6}${big ? ' big' : ''}`, 'aria-hidden': 'true' }, letter);
   }
   function hero(sub) {
-    return h('div', { class: 'hero' }, h('img', { src: 'icon-192.png', alt: '' }), h('h1', {}, 'Bóveda'), h('p', {}, sub));
+    return h('div', { class: 'hero' }, h('img', { src: 'icon-192.png', alt: '' }), h('h1', {}, 'Bóveda'), sub ? h('p', {}, sub) : null);
   }
   const val = (form, id) => form.querySelector('#' + id).value;
 
@@ -192,11 +257,45 @@
     if (a === b) return 'Las dos contraseñas tienen que ser distintas.';
     return '';
   }
+  const newPwFields = (pre = 'n', label = 'Nueva contraseña') => [
+    pwField(pre + '1', label + ' 1'), pwField(pre + '1b', 'Repetir ' + label.toLowerCase() + ' 1'),
+    pwField(pre + '2', label + ' 2'), pwField(pre + '2b', 'Repetir ' + label.toLowerCase() + ' 2'),
+  ];
+  const readNew = (f, pre = 'n') => {
+    const a = val(f, pre + '1'), b = val(f, pre + '2');
+    return { a, b, problem: checkNew(a, val(f, pre + '1b'), b, val(f, pre + '2b')) };
+  };
+  const confirmReplace = async () => !(await dbGet('vault')) ||
+    confirm('Esto reemplaza la bóveda que tenés ahora en este celular por la del respaldo. ¿Seguir?');
 
   // ---------- pantallas ----------
   async function home() {
     if (S.key) return viewList();
-    (await dbGet('vault')) ? viewUnlock() : viewSetup();
+    (await dbGet('vault')) ? viewUnlock() : viewWelcome(0);
+  }
+
+  // Bienvenida (3 pasos)
+  const SLIDES = [
+    ['Tus contraseñas, solo acá', 'Todo se guarda cifrado en este celular. No se manda nada a internet: ni siquiera quien hizo la app puede ver tus datos.'],
+    ['Dos contraseñas y un código', 'Para abrir la bóveda usás dos contraseñas. Además vas a recibir un código de recuperación para anotar en papel, por si alguna vez olvidás una.'],
+    ['Hacé respaldos', 'Si perdés el celular o se borran los datos del navegador, el respaldo es la única forma de recuperar todo. La app te lo va a pedir seguido.'],
+  ];
+  function viewWelcome(i, done) {
+    const [title, text] = SLIDES[i];
+    const last = i === SLIDES.length - 1;
+    show(
+      hero(),
+      h('div', { class: 'card welcome' },
+        h('div', { class: 'dots' }, SLIDES.map((_, j) => h('span', { class: j === i ? 'on' : '' }))),
+        h('span', { class: 'step' }, `${i + 1} de ${SLIDES.length}`),
+        h('h2', { class: 'wt' }, title),
+        h('p', { class: 'muted' }, text),
+        h('button', { class: 'primary', onclick: () => last ? (done ? done() : viewSetup()) : viewWelcome(i + 1, done) },
+          last ? (done ? 'Listo' : 'Empezar') : 'Siguiente'),
+        i > 0 ? h('button', { class: 'link', onclick: () => viewWelcome(i - 1, done) }, 'Atrás')
+          : (!done ? h('button', { class: 'link', onclick: pickBackup }, 'Ya tengo un respaldo') : null)
+      )
+    );
   }
 
   function viewSetup() {
@@ -204,26 +303,55 @@
     const btn = h('button', { type: 'submit', class: 'primary' }, 'Crear bóveda');
     const f = h('form', { class: 'card', onsubmit: async e => {
       e.preventDefault(); err.textContent = '';
-      const a = val(f, 'p1'), b = val(f, 'p2');
-      const problem = checkNew(a, val(f, 'p1b'), b, val(f, 'p2b'));
+      const { a, b, problem } = readNew(f, 'p');
       if (problem) { err.textContent = problem; return; }
+      let code;
       await busy(btn, 'Creando…', async () => {
-        S.salt = crypto.getRandomValues(new Uint8Array(16)); S.iter = ITER;
-        S.key = await deriveKey(a, b, S.salt, S.iter);
-        S.data = { entries: [], created: Date.now() };
-        await save();
+        code = await createVault(a, b, { entries: [], created: Date.now() });
+        await dbPut('changes', 0);
         try { await navigator.storage?.persist?.(); } catch {}
       });
-      bump(); viewList();
+      showNewCode(code, viewList);
     } },
       h('p', { class: 'muted' }, 'Elegí dos contraseñas distintas. Vas a necesitar las dos cada vez que abras la bóveda.'),
-      h('p', { class: 'note' }, 'Si olvidás cualquiera de las dos, no hay forma de recuperar los datos. Mejor frases largas que puedas recordar.'),
-      pwField('p1', 'Contraseña 1'), pwField('p1b', 'Repetir contraseña 1'),
-      pwField('p2', 'Contraseña 2'), pwField('p2b', 'Repetir contraseña 2'),
+      h('p', { class: 'note' }, 'Mejor frases largas que puedas recordar, que no uses en ningún otro lado.'),
+      ...newPwFields('p', 'Contraseña'),
       err, btn,
-      h('button', { type: 'button', class: 'link', onclick: pickBackup }, 'Ya tengo un respaldo')
+      h('button', { type: 'button', class: 'link', onclick: () => viewWelcome(0) }, '‹ Volver a la introducción')
     );
     show(hero('Creá tu bóveda'), f);
+  }
+
+  // Código de recuperación: se muestra una sola vez y hay que confirmarlo.
+  async function showNewCode(code, next) {
+    await dbPut('rcPending', true);
+    viewCode(code, next);
+  }
+  function viewCode(code, next) {
+    S.hold = true;
+    const groups = code.split('-');
+    const tail = groups[groups.length - 1];
+    const btn = h('button', { class: 'primary', disabled: true, onclick: async () => {
+      S.hold = false; bump();
+      await dbPut('rcPending', false);
+      toast('Código guardado');
+      next();
+    } }, 'Ya lo anoté');
+    const check = h('input', { type: 'text', placeholder: 'Últimos 4 caracteres', maxlength: '4', ...noAuto,
+      oninput: () => { btn.disabled = normCode(check.value) !== tail; } });
+    show(
+      topbar('Tu código'),
+      h('div', { class: 'card' },
+        h('p', { class: 'muted' }, 'Si olvidás alguna de tus dos contraseñas, con este código recuperás la bóveda.'),
+        h('div', { class: 'code' }, h('span', {}, groups.slice(0, 4).join('-')), h('span', {}, groups.slice(4).join('-'))),
+        h('ul', { class: 'tips' },
+          h('li', {}, 'Anotalo en papel y guardalo en un lugar seguro.'),
+          h('li', {}, 'No lo guardes en este mismo celular ni le saques foto.'),
+          h('li', {}, 'Se muestra una sola vez.')),
+        h('label', { class: 'field' }, h('span', {}, 'Para confirmar, escribí los últimos 4 caracteres'), check),
+        btn
+      )
+    );
   }
 
   function viewUnlock() {
@@ -232,35 +360,113 @@
     const f = h('form', { class: 'card', onsubmit: async e => {
       e.preventDefault(); err.textContent = '';
       const rec = await dbGet('vault');
-      try {
-        await busy(btn, 'Abriendo…', async () => {
-          const r = await decryptVault(rec, val(f, 'p1'), val(f, 'p2'));
-          Object.assign(S, { key: r.key, salt: r.salt, iter: r.iter, data: r.data });
-        });
-      } catch {
+      const p1 = val(f, 'p1'), p2 = val(f, 'p2');
+      let r;
+      try { r = await busy(btn, 'Abriendo…', () => openWithPasswords(rec, p1, p2)); }
+      catch {
         err.textContent = 'Alguna de las dos contraseñas es incorrecta.';
         f.querySelector('#p1').value = ''; f.querySelector('#p2').value = '';
         f.querySelector('#p1').focus();
         return;
       }
-      bump(); viewList();
+      if (r.legacy) {   // bóveda de la versión anterior: se pasa a la nueva con código de recuperación
+        const code = await createVault(p1, p2, r.legacy);
+        await markChanged();
+        return showNewCode(code, viewList);
+      }
+      setSession(r);
+      if (await dbGet('rcPending')) {   // el código anterior no llegó a confirmarse: se genera otro
+        const code = newRecoveryCode();
+        S.rec = { ...S.rec, rc: await makeSlot(normCode(code), S.dk) };
+        await save();
+        return showNewCode(code, viewList);
+      }
+      viewList();
     } },
       pwField('p1', 'Contraseña 1'), pwField('p2', 'Contraseña 2'), err, btn,
+      h('button', { type: 'button', class: 'link', onclick: async () => {
+        const rec = await dbGet('vault');
+        if (rec.v !== 2) { toast('Esta bóveda todavía no tiene código de recuperación'); return; }
+        viewRecover(rec, {});
+      } }, 'Olvidé una contraseña'),
       h('button', { type: 'button', class: 'link', onclick: pickBackup }, 'Restaurar desde un respaldo')
     );
     show(hero('Tus contraseñas, solo en este celular'), f);
   }
 
+  // Recuperar con el código: abre la bóveda y obliga a elegir dos contraseñas nuevas.
+  function viewRecover(rec, { fromBackup }) {
+    const err = errorBox();
+    const btn = h('button', { type: 'submit', class: 'primary' }, 'Continuar');
+    const f = h('form', { class: 'card', onsubmit: async e => {
+      e.preventDefault(); err.textContent = '';
+      const code = normCode(val(f, 'rc'));
+      if (!codeLooksValid(code)) { err.textContent = 'El código tiene 32 caracteres (letras y números).'; return; }
+      let r;
+      try { r = await busy(btn, 'Verificando…', async () => loadData(rec, await openSlot(code, rec.rc))); }
+      catch { err.textContent = 'Ese código no abre esta bóveda.'; return; }
+      viewRecoverNew(r, fromBackup);
+    } },
+      h('p', { class: 'muted' }, 'Ingresá el código de recuperación que anotaste cuando creaste la bóveda.'),
+      h('label', { class: 'field' }, h('span', {}, 'Código de recuperación'),
+        h('input', { id: 'rc', type: 'text', placeholder: 'XXXX-XXXX-XXXX-…', class: 'mono', ...noAuto })),
+      err, btn
+    );
+    show(topbar('Recuperar', back(home)), f);
+  }
+  function viewRecoverNew(r, fromBackup) {
+    const err = errorBox();
+    const btn = h('button', { type: 'submit', class: 'primary' }, 'Guardar y abrir');
+    const f = h('form', { class: 'card', onsubmit: async e => {
+      e.preventDefault(); err.textContent = '';
+      const { a, b, problem } = readNew(f);
+      if (problem) { err.textContent = problem; return; }
+      if (fromBackup && !(await confirmReplace())) return;
+      await busy(btn, 'Guardando…', async () => {
+        setSession(r);
+        S.rec = { ...S.rec, pw: await makeSlot(pwSecret(a, b), S.dk) };
+        await save();
+        await markChanged();
+      });
+      toast('Listo, ya tenés contraseñas nuevas'); viewList();
+    } },
+      h('p', { class: 'muted' }, 'El código es correcto. Elegí tus dos contraseñas nuevas.'),
+      h('p', { class: 'note' }, 'Tu código de recuperación sigue siendo el mismo.'),
+      ...newPwFields(), err, btn
+    );
+    show(topbar('Contraseñas nuevas'), f);
+  }
+
+  async function needsBackup() {
+    const [last, ch] = await Promise.all([dbGet('lastBackup'), dbGet('changes')]);
+    return (ch || 0) >= GATE_CHANGES || (!last && S.data.entries.length >= GATE_FIRST);
+  }
+  async function addEntry() { (await needsBackup()) ? viewGate() : viewEdit(null); }
+
+  async function viewGate() {
+    const [last, ch] = await Promise.all([dbGet('lastBackup'), dbGet('changes')]);
+    show(
+      topbar('Respaldo', back(viewList)),
+      h('div', { class: 'card gate' },
+        h('div', { class: 'gate-ico' }, '!'),
+        h('h2', { class: 'wt' }, 'Antes de seguir, hacé un respaldo'),
+        h('p', { class: 'muted' }, last
+          ? `Tenés ${ch} cambios que solo existen en este celular. Si lo perdés hoy, se pierden.`
+          : 'Todavía no hiciste ningún respaldo. Si perdés el celular hoy, perdés todo lo que cargaste.'),
+        h('p', { class: 'note' }, 'El archivo queda cifrado. Guardalo en Drive o mandátelo por mail.'),
+        h('button', { class: 'primary', onclick: async () => { if (await exportBackup()) viewEdit(null); } }, 'Exportar respaldo ahora')
+      )
+    );
+  }
+
   function backupBanner() {
     const slot = h('div');
-    dbGet('lastBackup').then(t => {
+    Promise.all([dbGet('lastBackup'), dbGet('changes')]).then(([last, ch]) => {
       if (!S.data || !S.data.entries.length) return;
-      const never = !t;
-      const stale = t && S.data.updated > t && (Date.now() - t) > BACKUP_NAG_DAYS * 864e5;
-      if (never || stale) {
-        slot.append(h('button', { class: 'banner', onclick: async () => { if (await exportBackup()) viewList(); } },
-          never ? 'Todavía no hiciste un respaldo. Tocá para exportarlo.' : 'Tenés cambios sin respaldar. Tocá para exportar un respaldo.'));
-      }
+      let msg = '';
+      if (!last) msg = 'Todavía no hiciste un respaldo. Tocá para exportarlo.';
+      else if (ch > 0) msg = `${ch} ${ch === 1 ? 'cambio' : 'cambios'} sin respaldar. Tocá para exportar.`;
+      if (msg) slot.append(h('button', { class: 'banner', onclick: async () => { if (await exportBackup()) viewList(); } }, msg));
     });
     return slot;
   }
@@ -284,7 +490,7 @@
     show(
       topbar('Bóveda', h('button', { class: 'small', onclick: lock }, 'Bloquear'), h('button', { class: 'small', onclick: viewSettings }, 'Ajustes')),
       backupBanner(), h('div', { class: 'pad' }, search), list,
-      h('button', { class: 'fab', onclick: () => viewEdit(null), 'aria-label': 'Agregar' }, '+')
+      h('button', { class: 'fab', onclick: addEntry, 'aria-label': 'Agregar' }, '+')
     );
   }
 
@@ -311,7 +517,8 @@
     if (x.notes) rows.push(h('div', { class: 'drow' }, h('span', { class: 'lbl' }, 'Notas'), h('p', { class: 'notes' }, x.notes)));
     show(
       topbar('', back(viewList), h('button', { class: 'small', onclick: () => viewEdit(x.id) }, 'Editar')),
-      h('div', { class: 'card' }, h('div', { class: 'dhead' }, avatar(x.title, true), h('div', { class: 'dt' }, x.title)), ...rows, h('p', { class: 'note' }, 'Modificado: ' + new Date(x.updated).toLocaleString('es-AR')))
+      h('div', { class: 'card' }, h('div', { class: 'dhead' }, avatar(x.title, true), h('div', { class: 'dt' }, x.title)), ...rows,
+        h('p', { class: 'note' }, 'Modificado: ' + new Date(x.updated).toLocaleString('es-AR')))
     );
   }
 
@@ -337,7 +544,7 @@
         url: String(fd.get('url')).trim(), notes: String(fd.get('notes')), created: x?.created || now, updated: now };
       const prev = S.data.entries;
       S.data.entries = x ? prev.map(e => e.id === x.id ? rec : e) : [...prev, rec];
-      try { await save(); } catch (ex) { S.data.entries = prev; err.textContent = 'No se pudo guardar: ' + ex.message; return; }
+      try { await save(); await markChanged(); } catch (ex) { S.data.entries = prev; err.textContent = 'No se pudo guardar: ' + ex.message; return; }
       toast('Guardado'); viewDetail(rec.id);
     } },
       field('title', 'Nombre (ej: Banco, Gmail)', x?.title, { autocapitalize: 'sentences' }),
@@ -351,7 +558,7 @@
         if (!confirm(`¿Borrar "${x.title}"? No se puede deshacer.`)) return;
         const prev = S.data.entries;
         S.data.entries = prev.filter(e => e.id !== x.id);
-        try { await save(); } catch (ex) { S.data.entries = prev; err.textContent = 'No se pudo borrar: ' + ex.message; return; }
+        try { await save(); await markChanged(); } catch (ex) { S.data.entries = prev; err.textContent = 'No se pudo borrar: ' + ex.message; return; }
         toast('Borrado'); viewList();
       } }, 'Borrar') : null
     );
@@ -359,19 +566,31 @@
   }
 
   async function viewSettings() {
-    const last = await dbGet('lastBackup');
+    const [last, ch] = await Promise.all([dbGet('lastBackup'), dbGet('changes')]);
     show(
       topbar('Ajustes', back(viewList)),
       h('div', { class: 'card' },
         h('h2', {}, 'Respaldo'),
-        h('p', { class: 'muted' }, last ? 'Último respaldo: ' + new Date(last).toLocaleString('es-AR') : 'Nunca hiciste un respaldo.'),
-        h('p', { class: 'note' }, 'El archivo queda cifrado con tus dos contraseñas. Podés guardarlo en Drive o mandártelo por mail: sin las contraseñas no sirve.'),
+        h('p', { class: 'muted' }, last
+          ? 'Último respaldo: ' + new Date(last).toLocaleString('es-AR') + (ch ? ` · ${ch} ${ch === 1 ? 'cambio' : 'cambios'} después` : ' · al día')
+          : 'Nunca hiciste un respaldo.'),
+        h('p', { class: 'note' }, 'El archivo queda cifrado: se abre con tus dos contraseñas o con tu código de recuperación. Podés guardarlo en Drive o mandártelo por mail.'),
         h('button', { class: 'primary', onclick: async () => { if (await exportBackup()) viewSettings(); } }, 'Exportar respaldo'),
         h('button', { onclick: pickBackup }, 'Restaurar un respaldo')),
       h('div', { class: 'card' },
         h('h2', {}, 'Seguridad'),
         h('button', { onclick: viewChange }, 'Cambiar las contraseñas'),
-        h('p', { class: 'note' }, `Se bloquea sola a los 5 minutos sin uso o a los 30 segundos de salir de la app. Entradas guardadas: ${S.data.entries.length}.`))
+        h('button', { onclick: async () => {
+          if (!confirm('Se va a generar un código nuevo y el anterior deja de servir para esta bóveda. ¿Seguir?')) return;
+          const code = newRecoveryCode();
+          S.rec = { ...S.rec, rc: await makeSlot(normCode(code), S.dk) };
+          await save(); await markChanged();
+          showNewCode(code, viewSettings);
+        } }, 'Nuevo código de recuperación'),
+        h('p', { class: 'note' }, `Se bloquea sola a los 5 minutos sin uso o a los 30 segundos de salir de la app. Entradas guardadas: ${S.data.entries.length}.`)),
+      h('div', { class: 'card' },
+        h('h2', {}, 'Ayuda'),
+        h('button', { onclick: () => viewWelcome(0, viewSettings) }, 'Cómo funciona'))
     );
   }
 
@@ -380,17 +599,15 @@
     const btn = h('button', { type: 'submit', class: 'primary' }, 'Cambiar');
     const f = h('form', { class: 'card', onsubmit: async e => {
       e.preventDefault(); err.textContent = '';
-      const a = val(f, 'n1'), b = val(f, 'n2');
-      const problem = checkNew(a, val(f, 'n1b'), b, val(f, 'n2b'));
+      const { a, b, problem } = readNew(f);
       if (problem) { err.textContent = problem; return; }
       try {
         await busy(btn, 'Cambiando…', async () => {
-          await decryptVault(await dbGet('vault'), val(f, 'c1'), val(f, 'c2'));  // verifica las actuales
-          const salt = crypto.getRandomValues(new Uint8Array(16));
-          const key = await deriveKey(a, b, salt, ITER);
-          const old = { key: S.key, salt: S.salt, iter: S.iter };
-          Object.assign(S, { key, salt, iter: ITER });
-          try { await save(); } catch (ex) { Object.assign(S, old); throw ex; }
+          await openSlot(pwSecret(val(f, 'c1'), val(f, 'c2')), S.rec.pw);   // verifica las actuales
+          const old = S.rec;
+          S.rec = { ...S.rec, pw: await makeSlot(pwSecret(a, b), S.dk) };
+          try { await save(); } catch (ex) { S.rec = old; throw ex; }
+          await markChanged();
         });
       } catch (ex) {
         err.textContent = ex.name === 'OperationError' ? 'Las contraseñas actuales no son correctas.' : 'No se pudo cambiar: ' + ex.message;
@@ -399,36 +616,36 @@
       toast('Contraseñas cambiadas'); viewSettings();
     } },
       pwField('c1', 'Contraseña 1 actual'), pwField('c2', 'Contraseña 2 actual'),
-      pwField('n1', 'Nueva contraseña 1'), pwField('n1b', 'Repetir nueva contraseña 1'),
-      pwField('n2', 'Nueva contraseña 2'), pwField('n2b', 'Repetir nueva contraseña 2'),
+      ...newPwFields(),
       h('p', { class: 'note' }, 'Los respaldos que ya exportaste siguen abriéndose con las contraseñas viejas. Exportá uno nuevo después de cambiarlas.'),
       err, btn
     );
     show(topbar('Cambiar contraseñas', back(viewSettings)), f);
   }
 
+  async function backupDone() {
+    await dbPut('lastBackup', Date.now());
+    await dbPut('changes', 0);
+    toast('Respaldo exportado');
+    return true;
+  }
   async function exportBackup() {
     const rec = await dbGet('vault');
     const name = `boveda-respaldo-${new Date().toISOString().slice(0, 10)}.json`;
     const file = new File([JSON.stringify(rec)], name, { type: 'application/json' });
     if (navigator.canShare && navigator.canShare({ files: [file] })) {
       try { await navigator.share({ files: [file], title: 'Respaldo Bóveda' }); }
-      catch (e) { if (e.name === 'AbortError') return false; return downloadFile(file); }
+      catch (e) { if (e.name === 'AbortError') return false; downloadFile(file); }
     } else {
       downloadFile(file);
     }
-    await dbPut('lastBackup', Date.now());
-    toast('Respaldo exportado');
-    return true;
+    return backupDone();
   }
-  async function downloadFile(file) {
+  function downloadFile(file) {
     const url = URL.createObjectURL(file);
     const a = h('a', { href: url, download: file.name });
     document.body.append(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 10000);
-    await dbPut('lastBackup', Date.now());
-    toast('Respaldo exportado');
-    return true;
   }
 
   function pickBackup() {
@@ -449,19 +666,28 @@
     const btn = h('button', { type: 'submit', class: 'primary' }, 'Restaurar');
     const f = h('form', { class: 'card', onsubmit: async e => {
       e.preventDefault(); err.textContent = '';
+      const p1 = val(f, 'p1'), p2 = val(f, 'p2');
       let r;
-      try { r = await busy(btn, 'Verificando…', () => decryptVault(rec, val(f, 'p1'), val(f, 'p2'))); }
+      try { r = await busy(btn, 'Verificando…', () => openWithPasswords(rec, p1, p2)); }
       catch { err.textContent = 'Esas contraseñas no abren este respaldo.'; return; }
-      if (await dbGet('vault') && !confirm('Esto reemplaza la bóveda que tenés ahora en este celular por la del respaldo. ¿Seguir?')) return;
+      if (!(await confirmReplace())) return;
+      try { await navigator.storage?.persist?.(); } catch {}
+      if (r.legacy) {
+        const code = await createVault(p1, p2, r.legacy);
+        await markChanged();
+        toast('Respaldo restaurado');
+        return showNewCode(code, viewList);
+      }
       await dbPut('vault', rec);
       await dbPut('lastBackup', Date.now());
-      Object.assign(S, { key: r.key, salt: r.salt, iter: r.iter, data: r.data });
-      try { await navigator.storage?.persist?.(); } catch {}
-      bump(); toast('Respaldo restaurado'); viewList();
+      await dbPut('changes', 0);
+      setSession(r);
+      toast('Respaldo restaurado'); viewList();
     } },
       h('p', { class: 'muted' }, 'Archivo: ' + fileName),
       h('p', { class: 'note' }, 'Ingresá las dos contraseñas que tenía la bóveda cuando hiciste este respaldo.'),
-      pwField('p1', 'Contraseña 1'), pwField('p2', 'Contraseña 2'), err, btn
+      pwField('p1', 'Contraseña 1'), pwField('p2', 'Contraseña 2'), err, btn,
+      rec.v === 2 ? h('button', { type: 'button', class: 'link', onclick: () => viewRecover(rec, { fromBackup: true }) }, 'Olvidé una contraseña: usar el código') : null
     );
     show(topbar('Restaurar', back(() => S.key ? viewSettings() : home())), f);
   }
