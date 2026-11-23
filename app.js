@@ -2,21 +2,24 @@
 /*
  * Bóveda — gestor de contraseñas personal.
  *
- * Cifrado (versión 2):
+ * Cifrado (versión 3):
  *  - Los datos se cifran con una clave aleatoria (AES-256-GCM).
  *  - Esa clave se guarda "envuelta" dos veces:
- *      1) con una clave que sale de tus DOS contraseñas, y
+ *      1) con una clave que sale de tu CONTRASEÑA, y
  *      2) con una clave que sale de tu CÓDIGO DE RECUPERACIÓN.
  *    Cualquiera de las dos abre la bóveda. Ninguna se guarda en ningún lado.
  *  - Derivación: PBKDF2-SHA256, 600.000 iteraciones.
  *  - Nada se envía a ningún servidor.
+ *
+ * Las bóvedas viejas (v1 y v2) se abrían con dos contraseñas. Se abren una
+ * última vez con las dos y en ese momento se elige la contraseña única (v3).
  */
 (() => {
   const ITER = 600000;
   const IDLE_MS = 5 * 60 * 1000;   // bloqueo por inactividad
   const HIDDEN_MS = 30 * 1000;     // bloqueo al salir de la app
   const CLIP_MS = 30 * 1000;       // se borra el portapapeles
-  const MIN_LEN = 8;
+  const MIN_LEN = 12;
   const GATE_CHANGES = 5;          // cambios sin respaldar que bloquean agregar
   const GATE_FIRST = 3;            // entradas sin ningún respaldo que bloquean agregar
   const B32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
@@ -87,7 +90,9 @@
   }
 
   // ---------- cifrado ----------
-  const pwSecret = (p1, p2) => p1.normalize('NFC') + '\u0000' + p2.normalize('NFC');
+  const pwSecret2 = (p1, p2) => p1.normalize('NFC') + '\u0000' + p2.normalize('NFC');   // bóvedas viejas
+  const pwSecret = p => p.normalize('NFC');
+  const isOld = rec => rec.v < 3;   // todavía se abre con dos contraseñas
 
   function newRecoveryCode() {
     let val = 0, bits = 0, out = '';
@@ -129,13 +134,14 @@
     const data = JSON.parse(dec.decode(await open(key, rec.data)));
     return { dk, key, data, rec };
   }
-  // Abre con las dos contraseñas. Las bóvedas de la versión 1 devuelven { legacy: datos }.
-  async function openWithPasswords(rec, p1, p2) {
+  // Abre con la contraseña (o con las dos, si la bóveda es vieja).
+  // Las bóvedas de la versión 1 devuelven { legacy: datos }.
+  async function openWithPassword(rec, p1, p2) {
     if (rec.v === 1) {
-      const k = await kek(pwSecret(p1, p2), fromB64(rec.salt), rec.iter);
+      const k = await kek(pwSecret2(p1, p2), fromB64(rec.salt), rec.iter);
       return { legacy: JSON.parse(dec.decode(await open(k, rec))) };
     }
-    return loadData(rec, await openSlot(pwSecret(p1, p2), rec.pw));
+    return loadData(rec, await openSlot(rec.v === 2 ? pwSecret2(p1, p2) : pwSecret(p1), rec.pw));
   }
 
   const isStr = x => typeof x === 'string' && x.length > 0;
@@ -145,7 +151,7 @@
   function validRecord(r) {
     if (!r || typeof r !== 'object' || r.app !== 'boveda') return false;
     if (r.v === 1) return okIter(r.iter) && isStr(r.salt) && okBox(r);
-    if (r.v === 2) return okSlot(r.pw) && okSlot(r.rc) && okBox(r.data);
+    if (r.v === 2 || r.v === 3) return okSlot(r.pw) && okSlot(r.rc) && okBox(r.data);
     return false;
   }
 
@@ -160,10 +166,10 @@
     S.rec = rec;
   }
   // Crea una bóveda nueva (o migra una vieja) y devuelve el código de recuperación.
-  async function createVault(p1, p2, data) {
+  async function createVault(p, data) {
     const dk = rand(32);
     const code = newRecoveryCode();
-    const rec = { app: 'boveda', v: 2, pw: await makeSlot(pwSecret(p1, p2), dk), rc: await makeSlot(normCode(code), dk) };
+    const rec = { app: 'boveda', v: 3, pw: await makeSlot(pwSecret(p), dk), rc: await makeSlot(normCode(code), dk) };
     setSession({ dk, key: await dataKey(dk), rec, data });
     await save();
     return code;
@@ -250,21 +256,23 @@
     } catch { toast('No se pudo copiar'); }
   }
 
-  function checkNew(a, a2, b, b2) {
-    if (a.length < MIN_LEN || b.length < MIN_LEN) return `Cada contraseña tiene que tener al menos ${MIN_LEN} caracteres.`;
-    if (a !== a2) return 'La contraseña 1 no coincide con su confirmación.';
-    if (b !== b2) return 'La contraseña 2 no coincide con su confirmación.';
-    if (a === b) return 'Las dos contraseñas tienen que ser distintas.';
+  function checkNew(a, a2) {
+    if (a.length < MIN_LEN) return `La contraseña tiene que tener al menos ${MIN_LEN} caracteres.`;
+    if (a !== a2) return 'La contraseña no coincide con su confirmación.';
     return '';
   }
   const newPwFields = (pre = 'n', label = 'Nueva contraseña') => [
-    pwField(pre + '1', label + ' 1'), pwField(pre + '1b', 'Repetir ' + label.toLowerCase() + ' 1'),
-    pwField(pre + '2', label + ' 2'), pwField(pre + '2b', 'Repetir ' + label.toLowerCase() + ' 2'),
+    pwField(pre + '1', label), pwField(pre + '1b', 'Repetir ' + label.toLowerCase()),
   ];
   const readNew = (f, pre = 'n') => {
-    const a = val(f, pre + '1'), b = val(f, pre + '2');
-    return { a, b, problem: checkNew(a, val(f, pre + '1b'), b, val(f, pre + '2b')) };
+    const a = val(f, pre + '1');
+    return { a, problem: checkNew(a, val(f, pre + '1b')) };
   };
+  // Campos para abrir: uno solo, o dos si la bóveda es vieja.
+  const unlockFields = rec => isOld(rec)
+    ? [pwField('p1', 'Contraseña 1'), pwField('p2', 'Contraseña 2')]
+    : [pwField('p1', 'Contraseña')];
+  const readUnlock = (f, rec) => [val(f, 'p1'), isOld(rec) ? val(f, 'p2') : ''];
   const confirmReplace = async () => !(await dbGet('vault')) ||
     confirm('Esto reemplaza la bóveda que tenés ahora en este celular por la del respaldo. ¿Seguir?');
 
@@ -277,7 +285,7 @@
   // Bienvenida (3 pasos)
   const SLIDES = [
     ['Tus contraseñas, solo acá', 'Todo se guarda cifrado en este celular. No se manda nada a internet: ni siquiera quien hizo la app puede ver tus datos.'],
-    ['Dos contraseñas y un código', 'Para abrir la bóveda usás dos contraseñas. Además vas a recibir un código de recuperación para anotar en papel, por si alguna vez olvidás una.'],
+    ['Una contraseña y un código', 'Para abrir la bóveda usás una contraseña. Además vas a recibir un código de recuperación para anotar en papel, por si alguna vez la olvidás.'],
     ['Hacé respaldos', 'Si perdés el celular o se borran los datos del navegador, el respaldo es la única forma de recuperar todo. La app te lo va a pedir seguido.'],
   ];
   function viewWelcome(i, done) {
@@ -303,18 +311,18 @@
     const btn = h('button', { type: 'submit', class: 'primary' }, 'Crear bóveda');
     const f = h('form', { class: 'card', onsubmit: async e => {
       e.preventDefault(); err.textContent = '';
-      const { a, b, problem } = readNew(f, 'p');
+      const { a, problem } = readNew(f, 'p');
       if (problem) { err.textContent = problem; return; }
       let code;
       await busy(btn, 'Creando…', async () => {
-        code = await createVault(a, b, { entries: [], created: Date.now() });
+        code = await createVault(a, { entries: [], created: Date.now() });
         await dbPut('changes', 0);
         try { await navigator.storage?.persist?.(); } catch {}
       });
       showNewCode(code, viewList);
     } },
-      h('p', { class: 'muted' }, 'Elegí dos contraseñas distintas. Vas a necesitar las dos cada vez que abras la bóveda.'),
-      h('p', { class: 'note' }, 'Mejor frases largas que puedas recordar, que no uses en ningún otro lado.'),
+      h('p', { class: 'muted' }, 'Elegí la contraseña con la que vas a abrir la bóveda.'),
+      h('p', { class: 'note' }, `Mejor una frase larga que puedas recordar (mínimo ${MIN_LEN} caracteres) y que no uses en ningún otro lado.`),
       ...newPwFields('p', 'Contraseña'),
       err, btn,
       h('button', { type: 'button', class: 'link', onclick: () => viewWelcome(0) }, '‹ Volver a la introducción')
@@ -342,7 +350,7 @@
     show(
       topbar('Tu código'),
       h('div', { class: 'card' },
-        h('p', { class: 'muted' }, 'Si olvidás alguna de tus dos contraseñas, con este código recuperás la bóveda.'),
+        h('p', { class: 'muted' }, 'Si olvidás tu contraseña, con este código recuperás la bóveda.'),
         h('div', { class: 'code' }, h('span', {}, groups.slice(0, 4).join('-')), h('span', {}, groups.slice(4).join('-'))),
         h('ul', { class: 'tips' },
           h('li', {}, 'Anotalo en papel y guardalo en un lugar seguro.'),
@@ -354,47 +362,81 @@
     );
   }
 
-  function viewUnlock() {
+  // Después de abrir: pasa las bóvedas viejas a contraseña única y revisa el código pendiente.
+  async function afterOpen(r) {
+    if (r.legacy || isOld(r.rec)) return viewMigrate(r);
+    setSession(r);
+    if (await dbGet('rcPending')) {   // el código anterior no llegó a confirmarse: se genera otro
+      const code = newRecoveryCode();
+      S.rec = { ...S.rec, rc: await makeSlot(normCode(code), S.dk) };
+      await save();
+      return showNewCode(code, viewList);
+    }
+    viewList();
+  }
+
+  async function viewUnlock() {
+    const rec = await dbGet('vault');
+    if (!rec) return home();
     const err = errorBox();
     const btn = h('button', { type: 'submit', class: 'primary' }, 'Abrir');
     const f = h('form', { class: 'card', onsubmit: async e => {
       e.preventDefault(); err.textContent = '';
-      const rec = await dbGet('vault');
-      const p1 = val(f, 'p1'), p2 = val(f, 'p2');
+      const [p1, p2] = readUnlock(f, rec);
       let r;
-      try { r = await busy(btn, 'Abriendo…', () => openWithPasswords(rec, p1, p2)); }
+      try { r = await busy(btn, 'Abriendo…', () => openWithPassword(rec, p1, p2)); }
       catch {
-        err.textContent = 'Alguna de las dos contraseñas es incorrecta.';
-        f.querySelector('#p1').value = ''; f.querySelector('#p2').value = '';
+        err.textContent = isOld(rec) ? 'Alguna de las dos contraseñas es incorrecta.' : 'Contraseña incorrecta.';
+        f.querySelectorAll('input').forEach(i => { i.value = ''; });
         f.querySelector('#p1').focus();
         return;
       }
-      if (r.legacy) {   // bóveda de la versión anterior: se pasa a la nueva con código de recuperación
-        const code = await createVault(p1, p2, r.legacy);
-        await markChanged();
-        return showNewCode(code, viewList);
-      }
-      setSession(r);
-      if (await dbGet('rcPending')) {   // el código anterior no llegó a confirmarse: se genera otro
-        const code = newRecoveryCode();
-        S.rec = { ...S.rec, rc: await makeSlot(normCode(code), S.dk) };
-        await save();
-        return showNewCode(code, viewList);
-      }
-      viewList();
+      afterOpen(r);
     } },
-      pwField('p1', 'Contraseña 1'), pwField('p2', 'Contraseña 2'), err, btn,
-      h('button', { type: 'button', class: 'link', onclick: async () => {
-        const rec = await dbGet('vault');
-        if (rec.v !== 2) { toast('Esta bóveda todavía no tiene código de recuperación'); return; }
+      isOld(rec) ? h('p', { class: 'note' }, 'Entrá una última vez con tus dos contraseñas. Después vas a elegir una sola.') : null,
+      ...unlockFields(rec), err, btn,
+      h('button', { type: 'button', class: 'link', onclick: () => {
+        if (rec.v === 1) { toast('Esta bóveda todavía no tiene código de recuperación'); return; }
         viewRecover(rec, {});
-      } }, 'Olvidé una contraseña'),
+      } }, 'Olvidé mi contraseña'),
       h('button', { type: 'button', class: 'link', onclick: pickBackup }, 'Restaurar desde un respaldo')
     );
     show(hero('Tus contraseñas, solo en este celular'), f);
   }
 
-  // Recuperar con el código: abre la bóveda y obliga a elegir dos contraseñas nuevas.
+  // Pasar de dos contraseñas a una sola (una vez, en bóvedas viejas).
+  function viewMigrate(r) {
+    const err = errorBox();
+    const btn = h('button', { type: 'submit', class: 'primary' }, 'Guardar y abrir');
+    const f = h('form', { class: 'card', onsubmit: async e => {
+      e.preventDefault(); err.textContent = '';
+      const { a, problem } = readNew(f);
+      if (problem) { err.textContent = problem; return; }
+      try {
+        await busy(btn, 'Guardando…', async () => {
+          if (r.legacy) {
+            const code = await createVault(a, r.legacy);
+            await markChanged();
+            showNewCode(code, viewList);
+            return;
+          }
+          setSession(r);
+          S.rec = { ...S.rec, v: 3, pw: await makeSlot(pwSecret(a), S.dk) };
+          await save();
+          await markChanged();
+          toast('Listo: ahora entrás con una sola contraseña');
+          afterOpen({ ...r, rec: S.rec, dk: S.dk, key: S.key, data: S.data });
+        });
+      } catch (ex) { err.textContent = 'No se pudo guardar: ' + ex.message; }
+    } },
+      h('p', { class: 'muted' }, 'Desde ahora la bóveda se abre con una sola contraseña. Elegí cuál va a ser.'),
+      h('p', { class: 'note' }, `Mínimo ${MIN_LEN} caracteres. Puede ser una de las que ya usabas si es larga, o una frase nueva.`),
+      ...newPwFields(), err, btn
+    );
+    show(topbar('Una sola contraseña'), f);
+  }
+
+  // Recuperar con el código: abre la bóveda y obliga a elegir una contraseña nueva.
   function viewRecover(rec, { fromBackup }) {
     const err = errorBox();
     const btn = h('button', { type: 'submit', class: 'primary' }, 'Continuar');
@@ -419,22 +461,22 @@
     const btn = h('button', { type: 'submit', class: 'primary' }, 'Guardar y abrir');
     const f = h('form', { class: 'card', onsubmit: async e => {
       e.preventDefault(); err.textContent = '';
-      const { a, b, problem } = readNew(f);
+      const { a, problem } = readNew(f);
       if (problem) { err.textContent = problem; return; }
       if (fromBackup && !(await confirmReplace())) return;
       await busy(btn, 'Guardando…', async () => {
         setSession(r);
-        S.rec = { ...S.rec, pw: await makeSlot(pwSecret(a, b), S.dk) };
+        S.rec = { ...S.rec, v: 3, pw: await makeSlot(pwSecret(a), S.dk) };
         await save();
         await markChanged();
       });
-      toast('Listo, ya tenés contraseñas nuevas'); viewList();
+      toast('Listo, ya tenés contraseña nueva'); viewList();
     } },
-      h('p', { class: 'muted' }, 'El código es correcto. Elegí tus dos contraseñas nuevas.'),
+      h('p', { class: 'muted' }, 'El código es correcto. Elegí tu contraseña nueva.'),
       h('p', { class: 'note' }, 'Tu código de recuperación sigue siendo el mismo.'),
       ...newPwFields(), err, btn
     );
-    show(topbar('Contraseñas nuevas'), f);
+    show(topbar('Contraseña nueva'), f);
   }
 
   async function needsBackup() {
@@ -574,12 +616,12 @@
         h('p', { class: 'muted' }, last
           ? 'Último respaldo: ' + new Date(last).toLocaleString('es-AR') + (ch ? ` · ${ch} ${ch === 1 ? 'cambio' : 'cambios'} después` : ' · al día')
           : 'Nunca hiciste un respaldo.'),
-        h('p', { class: 'note' }, 'El archivo queda cifrado: se abre con tus dos contraseñas o con tu código de recuperación. Podés guardarlo en Drive o mandártelo por mail.'),
+        h('p', { class: 'note' }, 'El archivo queda cifrado: se abre con tu contraseña o con tu código de recuperación. Podés guardarlo en Drive o mandártelo por mail.'),
         h('button', { class: 'primary', onclick: async () => { if (await exportBackup()) viewSettings(); } }, 'Exportar respaldo'),
         h('button', { onclick: pickBackup }, 'Restaurar un respaldo')),
       h('div', { class: 'card' },
         h('h2', {}, 'Seguridad'),
-        h('button', { onclick: viewChange }, 'Cambiar las contraseñas'),
+        h('button', { onclick: viewChange }, 'Cambiar la contraseña'),
         h('button', { onclick: async () => {
           if (!confirm('Se va a generar un código nuevo y el anterior deja de servir para esta bóveda. ¿Seguir?')) return;
           const code = newRecoveryCode();
@@ -599,28 +641,28 @@
     const btn = h('button', { type: 'submit', class: 'primary' }, 'Cambiar');
     const f = h('form', { class: 'card', onsubmit: async e => {
       e.preventDefault(); err.textContent = '';
-      const { a, b, problem } = readNew(f);
+      const { a, problem } = readNew(f);
       if (problem) { err.textContent = problem; return; }
       try {
         await busy(btn, 'Cambiando…', async () => {
-          await openSlot(pwSecret(val(f, 'c1'), val(f, 'c2')), S.rec.pw);   // verifica las actuales
+          await openSlot(pwSecret(val(f, 'c1')), S.rec.pw);   // verifica la actual
           const old = S.rec;
-          S.rec = { ...S.rec, pw: await makeSlot(pwSecret(a, b), S.dk) };
+          S.rec = { ...S.rec, pw: await makeSlot(pwSecret(a), S.dk) };
           try { await save(); } catch (ex) { S.rec = old; throw ex; }
           await markChanged();
         });
       } catch (ex) {
-        err.textContent = ex.name === 'OperationError' ? 'Las contraseñas actuales no son correctas.' : 'No se pudo cambiar: ' + ex.message;
+        err.textContent = ex.name === 'OperationError' ? 'La contraseña actual no es correcta.' : 'No se pudo cambiar: ' + ex.message;
         return;
       }
-      toast('Contraseñas cambiadas'); viewSettings();
+      toast('Contraseña cambiada'); viewSettings();
     } },
-      pwField('c1', 'Contraseña 1 actual'), pwField('c2', 'Contraseña 2 actual'),
+      pwField('c1', 'Contraseña actual'),
       ...newPwFields(),
-      h('p', { class: 'note' }, 'Los respaldos que ya exportaste siguen abriéndose con las contraseñas viejas. Exportá uno nuevo después de cambiarlas.'),
+      h('p', { class: 'note' }, 'Los respaldos que ya exportaste siguen abriéndose con la contraseña vieja. Exportá uno nuevo después de cambiarla.'),
       err, btn
     );
-    show(topbar('Cambiar contraseñas', back(viewSettings)), f);
+    show(topbar('Cambiar contraseña', back(viewSettings)), f);
   }
 
   async function backupDone() {
@@ -666,28 +708,25 @@
     const btn = h('button', { type: 'submit', class: 'primary' }, 'Restaurar');
     const f = h('form', { class: 'card', onsubmit: async e => {
       e.preventDefault(); err.textContent = '';
-      const p1 = val(f, 'p1'), p2 = val(f, 'p2');
+      const [p1, p2] = readUnlock(f, rec);
       let r;
-      try { r = await busy(btn, 'Verificando…', () => openWithPasswords(rec, p1, p2)); }
-      catch { err.textContent = 'Esas contraseñas no abren este respaldo.'; return; }
+      try { r = await busy(btn, 'Verificando…', () => openWithPassword(rec, p1, p2)); }
+      catch { err.textContent = isOld(rec) ? 'Esas contraseñas no abren este respaldo.' : 'Esa contraseña no abre este respaldo.'; return; }
       if (!(await confirmReplace())) return;
       try { await navigator.storage?.persist?.(); } catch {}
-      if (r.legacy) {
-        const code = await createVault(p1, p2, r.legacy);
-        await markChanged();
-        toast('Respaldo restaurado');
-        return showNewCode(code, viewList);
-      }
+      toast('Respaldo restaurado');
+      if (r.legacy) return viewMigrate(r);
       await dbPut('vault', rec);
       await dbPut('lastBackup', Date.now());
       await dbPut('changes', 0);
-      setSession(r);
-      toast('Respaldo restaurado'); viewList();
+      afterOpen(r);   // si el respaldo es de dos contraseñas, pide elegir una sola
     } },
       h('p', { class: 'muted' }, 'Archivo: ' + fileName),
-      h('p', { class: 'note' }, 'Ingresá las dos contraseñas que tenía la bóveda cuando hiciste este respaldo.'),
-      pwField('p1', 'Contraseña 1'), pwField('p2', 'Contraseña 2'), err, btn,
-      rec.v === 2 ? h('button', { type: 'button', class: 'link', onclick: () => viewRecover(rec, { fromBackup: true }) }, 'Olvidé una contraseña: usar el código') : null
+      h('p', { class: 'note' }, isOld(rec)
+        ? 'Este respaldo es de cuando usabas dos contraseñas: ingresá las dos que tenía en ese momento.'
+        : 'Ingresá la contraseña que tenía la bóveda cuando hiciste este respaldo.'),
+      ...unlockFields(rec), err, btn,
+      rec.v >= 2 ? h('button', { type: 'button', class: 'link', onclick: () => viewRecover(rec, { fromBackup: true }) }, 'Olvidé la contraseña: usar el código') : null
     );
     show(topbar('Restaurar', back(() => S.key ? viewSettings() : home())), f);
   }
