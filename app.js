@@ -19,7 +19,7 @@
   const IDLE_MS = 5 * 60 * 1000;   // bloqueo por inactividad
   const HIDDEN_MS = 30 * 1000;     // bloqueo al salir de la app
   const CLIP_MS = 30 * 1000;       // se borra el portapapeles
-  const MIN_LEN = 12;
+  const MIN_LEN = 4;
   const GATE_CHANGES = 5;          // cambios sin respaldar que bloquean agregar
   const GATE_FIRST = 3;            // entradas sin ningún respaldo que bloquean agregar
   const B32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
@@ -257,7 +257,9 @@
   }
 
   function checkNew(a, a2) {
-    if (a.length < MIN_LEN) return `La contraseña tiene que tener al menos ${MIN_LEN} caracteres.`;
+    if ([...a].length < MIN_LEN) return `La contraseña tiene que tener al menos ${MIN_LEN} caracteres.`;
+    if (!/\p{L}/u.test(a) || !/\p{N}/u.test(a) || !/[^\p{L}\p{N}\s]/u.test(a))
+      return 'La contraseña tiene que tener letras, números y símbolos.';
     if (a !== a2) return 'La contraseña no coincide con su confirmación.';
     return '';
   }
@@ -322,7 +324,7 @@
       showNewCode(code, viewList);
     } },
       h('p', { class: 'muted' }, 'Elegí la contraseña con la que vas a abrir la bóveda.'),
-      h('p', { class: 'note' }, `Mejor una frase larga que puedas recordar (mínimo ${MIN_LEN} caracteres) y que no uses en ningún otro lado.`),
+      h('p', { class: 'note' }, `Mínimo ${MIN_LEN} caracteres, con letras, números y símbolos (por ejemplo: ! # $ % & * ? @). Que no la uses en ningún otro lado.`),
       ...newPwFields('p', 'Contraseña'),
       err, btn,
       h('button', { type: 'button', class: 'link', onclick: () => viewWelcome(0) }, '‹ Volver a la introducción')
@@ -430,7 +432,7 @@
       } catch (ex) { err.textContent = 'No se pudo guardar: ' + ex.message; }
     } },
       h('p', { class: 'muted' }, 'Desde ahora la bóveda se abre con una sola contraseña. Elegí cuál va a ser.'),
-      h('p', { class: 'note' }, `Mínimo ${MIN_LEN} caracteres. Puede ser una de las que ya usabas si es larga, o una frase nueva.`),
+      h('p', { class: 'note' }, `Mínimo ${MIN_LEN} caracteres, con letras, números y símbolos. Puede ser una de las que ya usabas.`),
       ...newPwFields(), err, btn
     );
     show(topbar('Una sola contraseña'), f);
@@ -474,6 +476,7 @@
     } },
       h('p', { class: 'muted' }, 'El código es correcto. Elegí tu contraseña nueva.'),
       h('p', { class: 'note' }, 'Tu código de recuperación sigue siendo el mismo.'),
+      h('p', { class: 'note' }, `Mínimo ${MIN_LEN} caracteres, con letras, números y símbolos.`),
       ...newPwFields(), err, btn
     );
     show(topbar('Contraseña nueva'), f);
@@ -659,6 +662,7 @@
     } },
       pwField('c1', 'Contraseña actual'),
       ...newPwFields(),
+      h('p', { class: 'note' }, `Mínimo ${MIN_LEN} caracteres, con letras, números y símbolos.`),
       h('p', { class: 'note' }, 'Los respaldos que ya exportaste siguen abriéndose con la contraseña vieja. Exportá uno nuevo después de cambiarla.'),
       err, btn
     );

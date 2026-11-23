@@ -1,6 +1,6 @@
 // Guarda los archivos de la app para que funcione sin conexión.
 // Nunca guarda ni ve tus datos: esos viven cifrados en IndexedDB.
-const CACHE = 'boveda-v4';
+const CACHE = 'boveda-v5';
 const FILES = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest',
   'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
 
